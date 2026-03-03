@@ -72,7 +72,12 @@ def requer_admin(f):
     def wrapper(*args, **kwargs):
         key = (request.headers.get("X-Admin-Key") or
                request.headers.get("Authorization", "").replace("Bearer ", ""))
-        if not hmac.compare_digest(key, ADMIN_API_KEY):
+        # .strip() evita 401 por espaços/newlines copiados acidentalmente
+        key      = (key or "").strip()
+        expected = ADMIN_API_KEY.strip()
+        if not key or not hmac.compare_digest(
+            key.encode("utf-8"), expected.encode("utf-8")
+        ):
             return jsonify({"erro": "Não autorizado"}), 401
         return f(*args, **kwargs)
     return wrapper
@@ -325,6 +330,14 @@ def _modulos_plano(plano):  return PLANOS.get(plano, PLANOS["BASICO"])["modulos"
 @app.get("/health")
 def health():
     return jsonify({"status": "ok", "ts": _agora()})
+
+
+# ── Ping autenticado — testa se a chave está correta ──────────
+# Acesse: GET /api/admin/ping com header X-Admin-Key: SUA_CHAVE
+@app.get("/api/admin/ping")
+@requer_admin
+def ping():
+    return jsonify({"status": "ok", "msg": "Chave válida!", "ts": _agora()})
 
 
 if __name__ == "__main__":
