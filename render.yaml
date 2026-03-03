@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: pdverp-licencas
+    env: python
+    buildCommand: pip install -r requirements.txt && python init_db.py
+    startCommand: gunicorn "app:app" --bind 0.0.0.0:$PORT --workers 2 --timeout 30
+    envVars:
+      - key: HMAC_SECRET
+        generateValue: true          # Render gera automaticamente
+      - key: ADMIN_API_KEY
+        generateValue: true          # Render gera automaticamente
+      - key: GRACE_DIAS
+        value: "7"
+      - key: DB_PATH
+        value: "/var/data/licencas.db"
+    disk:
+      name: licencas-data
+      mountPath: /var/data
+      sizeGB: 1
