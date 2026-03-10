@@ -295,6 +295,20 @@ def mudar_status(lid: int, status: str):
         conn.close()
 
 
+def atualizar_versao_app(lid: int, versao: str):
+    p = _ph()
+    conn = _conn()
+    try:
+        with _cur(conn) as cur:
+            cur.execute(
+                f"UPDATE licencas SET versao_app={p} WHERE id={p}",
+                (versao, lid)
+            )
+            conn.commit()
+    finally:
+        conn.close()
+
+
 def resetar_fingerprint(lid: int):
     p = _ph()
     conn = _conn()
@@ -378,6 +392,8 @@ def estatisticas() -> dict:
         "expiradas":     n(f"SELECT COUNT(*) FROM licencas WHERE validade_ate IS NOT NULL AND validade_ate < {p} AND status='ATIVA'", (hoje,)),
         "expirando_30d": n(f"SELECT COUNT(*) FROM licencas WHERE status='ATIVA' AND validade_ate IS NOT NULL AND validade_ate BETWEEN {p} AND {p}", (hoje, d30)),
         "por_plano":     q("SELECT plano, COUNT(*) as n FROM licencas GROUP BY plano ORDER BY n DESC"),
+        "por_versao":    q("SELECT COALESCE(versao_app, 'desconhecida') as versao, COUNT(*) as n FROM licencas WHERE status='ATIVA' GROUP BY versao_app ORDER BY n DESC"),
+        "sem_versao":    n(f"SELECT COUNT(*) FROM licencas WHERE status='ATIVA' AND (versao_app IS NULL OR versao_app={p})", ("",)),
         "eventos_30d":   q(f"SELECT tipo, COUNT(*) as n FROM eventos WHERE criado_em >= {ago30} GROUP BY tipo ORDER BY n DESC LIMIT 10"),
-        "ultimas_licencas": q("SELECT cliente_nome, chave, plano, status, criado_em FROM licencas ORDER BY criado_em DESC LIMIT 10"),
+        "ultimas_licencas": q("SELECT cliente_nome, chave, plano, status, versao_app, criado_em FROM licencas ORDER BY criado_em DESC LIMIT 10"),
     }

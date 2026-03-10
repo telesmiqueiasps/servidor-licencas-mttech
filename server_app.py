@@ -143,11 +143,21 @@ def ativar():
         }), 200
 
     # Tudo ok — ativa / atualiza
-    grace = _grace()
+    grace  = _grace()
+    versao = (body.get("versao") or "").strip()
     db.ativar_licenca(lic["id"], fingerprint or lic.get("fingerprint"), grace)
     db.registrar_evento(lic["id"], "ATIVACAO_OK",
-                        f"v{body.get('versao','?')} FP={fingerprint[:16]}",
+                        f"v{versao or '?'} FP={fingerprint[:16]}",
                         _ip(), fingerprint)
+
+    # Rastreia versão do PDV do cliente
+    if versao:
+        versao_anterior = (lic.get("versao_app") or "").strip()
+        db.atualizar_versao_app(lic["id"], versao)
+        if versao != versao_anterior:
+            db.registrar_evento(lic["id"], "VERSAO_ATUALIZADA",
+                                f"{versao_anterior or '?'} → {versao}",
+                                _ip(), fingerprint)
 
     return jsonify({
         "valida":       True,
@@ -187,9 +197,20 @@ def validar():
         return jsonify({"valida": False,
                         "motivo": f"Expirada em {lic['validade_ate']}."})
 
-    grace = _grace()
+    grace  = _grace()
+    versao = (body.get("versao") or "").strip()
     db.atualizar_check(lic["id"], grace)
-    db.registrar_evento(lic["id"], "CHECK_OK", "", _ip(), fingerprint)
+    db.registrar_evento(lic["id"], "CHECK_OK",
+                        f"v{versao}" if versao else "", _ip(), fingerprint)
+
+    # Rastreia versão do PDV do cliente
+    if versao:
+        versao_anterior = (lic.get("versao_app") or "").strip()
+        db.atualizar_versao_app(lic["id"], versao)
+        if versao != versao_anterior:
+            db.registrar_evento(lic["id"], "VERSAO_ATUALIZADA",
+                                f"{versao_anterior or '?'} → {versao}",
+                                _ip(), fingerprint)
 
     return jsonify({
         "valida":       True,
@@ -334,6 +355,17 @@ def versao_atual():
     url       = os.environ.get("URL_DOWNLOAD", "")
     obrigat   = os.environ.get("VERSAO_OBRIGATORIA", "false").strip().lower() == "true"
     novidades = os.environ.get("VERSAO_NOVIDADES", "")
+
+    # Log opcional: PDV pode passar ?chave=XXXX para rastrear quem verificou
+    chave = request.args.get("chave", "").strip().upper()
+    if chave:
+        lic = db.buscar_por_chave(chave)
+        if lic:
+            versao_cliente = request.args.get("versao_atual", "").strip()
+            db.registrar_evento(lic["id"], "VERSAO_CHECK",
+                                f"Verificou update — cliente v{versao_cliente or '?'} → servidor v{versao}",
+                                _ip(), "")
+
     return jsonify({
         "versao":       versao,
         "url_download": url,
