@@ -3,6 +3,7 @@ Servidor de Licenças — PDV/ERP
 Deploy: Render (render.com) — gratuito
 
 Endpoints públicos (chamados pelo sistema do cliente):
+  GET  /versao-atual      — versão disponível para download (sem autenticação)
   POST /api/v1/ativar     — ativa uma chave
   POST /api/v1/validar    — valida / renova check online
 
@@ -324,6 +325,21 @@ PLANOS = {
 
 def _usuarios_plano(plano): return PLANOS.get(plano, PLANOS["BASICO"])["max_usuarios"]
 def _modulos_plano(plano):  return PLANOS.get(plano, PLANOS["BASICO"])["modulos"]
+
+
+# ── Versão atual do aplicativo ────────────────────────────────
+@app.get("/versao-atual")
+def versao_atual():
+    versao    = os.environ.get("VERSAO_ATUAL", "0.0.0")
+    url       = os.environ.get("URL_DOWNLOAD", "")
+    obrigat   = os.environ.get("VERSAO_OBRIGATORIA", "false").strip().lower() == "true"
+    novidades = os.environ.get("VERSAO_NOVIDADES", "")
+    return jsonify({
+        "versao":       versao,
+        "url_download": url,
+        "obrigatoria":  obrigat,
+        "novidades":    novidades,
+    })
 
 
 # ── Health check (Render usa para saber se está vivo) ─────────
