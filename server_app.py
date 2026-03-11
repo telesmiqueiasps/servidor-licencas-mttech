@@ -14,6 +14,11 @@ Endpoints admin (protegidos por API_KEY no header):
   POST /api/admin/licencas/<id>/revogar   — bloquear
   POST /api/admin/licencas/<id>/reativar  — desbloquear
   GET  /api/admin/dashboard         — estatísticas
+  GET  /api/admin/backups           — lista clientes com status de backup
+  GET  /api/admin/backup/download/<id>    — URL pré-assinada (1h) para download
+
+Backup (chamado pelo PDV do cliente):
+  POST /api/backup/upload           — envia ZIP ao Backblaze B2
 """
 import os
 import hmac
@@ -24,6 +29,8 @@ import json
 from functools import wraps
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+import boto3
+from botocore.config import Config
 import database as db
 
 app = Flask(__name__)
@@ -33,6 +40,20 @@ CORS(app)  # permite requisições do painel Netlify
 HMAC_SECRET  = os.environ.get("HMAC_SECRET",  "TROQUE-ESTE-SEGREDO-EM-PRODUCAO").encode()
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "TROQUE-ESTA-CHAVE-ADMIN")
 GRACE_DIAS   = int(os.environ.get("GRACE_DIAS", "7"))
+
+# ── Backblaze B2 ──────────────────────────────────────────────
+B2_BUCKET = os.environ.get("B2_BUCKET_NAME", "")
+_B2_REGION = os.environ.get("B2_REGION", "us-east-005")
+
+def _b2():
+    return boto3.client(
+        "s3",
+        endpoint_url=f"https://s3.{_B2_REGION}.backblazeb2.com",
+        aws_access_key_id=os.environ.get("B2_KEY_ID"),
+        aws_secret_access_key=os.environ.get("B2_APPLICATION_KEY"),
+        region_name=_B2_REGION,
+        config=Config(signature_version="s3v4"),
+    )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -372,6 +393,71 @@ def versao_atual():
         "obrigatoria":  obrigat,
         "novidades":    novidades,
     })
+
+
+# ═══════════════════════════════════════════════════════════════
+# BACKUP — Backblaze B2
+# ═══════════════════════════════════════════════════════════════
+
+@app.post("/api/backup/upload")
+def backup_upload():
+    cnpj          = "".join(filter(str.isdigit, request.form.get("cnpj") or ""))
+    chave_licenca = (request.form.get("chave_licenca") or "").strip().upper()
+    arquivo       = request.files.get("arquivo")
+
+    if not cnpj or not chave_licenca or not arquivo:
+        return jsonify({"erro": "Campos obrigatórios: cnpj, chave_licenca, arquivo"}), 400
+
+    lic = db.buscar_por_chave(chave_licenca)
+    if not lic or lic["status"] != "ATIVA":
+        return jsonify({"erro": "Licença inválida ou inativa"}), 401
+
+    now     = datetime.datetime.now(datetime.timezone.utc)
+    nome_b2 = f"{cnpj}/{now.strftime('%Y-%m-%d_%H-%M')}.zip"
+    conteudo   = arquivo.read()
+    tamanho_kb = len(conteudo) // 1024
+
+    _b2().put_object(
+        Bucket=B2_BUCKET,
+        Key=nome_b2,
+        Body=conteudo,
+        ContentType="application/zip",
+    )
+
+    db.registrar_backup(lic["id"], cnpj, lic.get("cliente_nome", ""), nome_b2, tamanho_kb)
+    db.registrar_evento(lic["id"], "BACKUP_ENVIADO",
+                        f"{nome_b2} ({tamanho_kb} KB)", _ip(), "")
+
+    # Manter apenas os 7 backups mais recentes por CNPJ
+    todos = db.backups_por_cnpj(cnpj)
+    for antigo in todos[7:]:
+        try:
+            _b2().delete_object(Bucket=B2_BUCKET, Key=antigo["arquivo_b2"])
+        except Exception:
+            pass
+        db.deletar_backup(antigo["id"])
+
+    return jsonify({"ok": True, "arquivo": nome_b2})
+
+
+@app.get("/api/admin/backups")
+@requer_admin
+def admin_backups():
+    return jsonify(db.listar_backups_admin())
+
+
+@app.get("/api/admin/backup/download/<int:backup_id>")
+@requer_admin
+def admin_backup_download(backup_id):
+    bkp = db.buscar_backup(backup_id)
+    if not bkp:
+        return jsonify({"erro": "Não encontrado"}), 404
+    url = _b2().generate_presigned_url(
+        "get_object",
+        Params={"Bucket": B2_BUCKET, "Key": bkp["arquivo_b2"]},
+        ExpiresIn=3600,
+    )
+    return jsonify({"url": url})
 
 
 # ── Health check (Render usa para saber se está vivo) ─────────

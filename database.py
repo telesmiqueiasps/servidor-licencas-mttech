@@ -71,7 +71,7 @@ def _fetchall(cur) -> list:
 
 
 def _agora() -> str:
-    return datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -103,6 +103,7 @@ def init():
                 grace_ate      TEXT,
                 fingerprint    TEXT,
                 obs            TEXT,
+                versao_app     TEXT,
                 criado_em      TIMESTAMP DEFAULT NOW()
             );
             CREATE TABLE IF NOT EXISTS eventos (
@@ -118,6 +119,16 @@ def init():
             CREATE INDEX IF NOT EXISTS idx_lic_cnpj   ON licencas(cnpj_empresa);
             CREATE INDEX IF NOT EXISTS idx_lic_status ON licencas(status);
             CREATE INDEX IF NOT EXISTS idx_ev_lid     ON eventos(licenca_id, criado_em DESC);
+            CREATE TABLE IF NOT EXISTS backups (
+                id           SERIAL PRIMARY KEY,
+                licenca_id   INTEGER REFERENCES licencas(id),
+                cnpj         TEXT NOT NULL,
+                cliente_nome TEXT,
+                arquivo_b2   TEXT NOT NULL,
+                tamanho_kb   INTEGER DEFAULT 0,
+                criado_em    TIMESTAMP DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_bkp_cnpj ON backups(cnpj, criado_em DESC);
             """)
         conn.close()
         print("PostgreSQL: tabelas verificadas/criadas.")
@@ -144,6 +155,7 @@ def init():
                 grace_ate      TEXT,
                 fingerprint    TEXT,
                 obs            TEXT,
+                versao_app     TEXT,
                 criado_em      TEXT DEFAULT (datetime('now'))
             );
             CREATE TABLE IF NOT EXISTS eventos (
@@ -159,6 +171,16 @@ def init():
             CREATE INDEX IF NOT EXISTS idx_lic_cnpj   ON licencas(cnpj_empresa);
             CREATE INDEX IF NOT EXISTS idx_lic_status ON licencas(status);
             CREATE INDEX IF NOT EXISTS idx_ev_lid     ON eventos(licenca_id, criado_em DESC);
+            CREATE TABLE IF NOT EXISTS backups (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                licenca_id   INTEGER REFERENCES licencas(id),
+                cnpj         TEXT NOT NULL,
+                cliente_nome TEXT,
+                arquivo_b2   TEXT NOT NULL,
+                tamanho_kb   INTEGER DEFAULT 0,
+                criado_em    TEXT DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_bkp_cnpj ON backups(cnpj, criado_em DESC);
             """)
         print("SQLite: tabelas verificadas/criadas.")
 
@@ -321,6 +343,104 @@ def resetar_fingerprint(lid: int):
             conn.commit()
     finally:
         conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════
+# Backups
+# ═══════════════════════════════════════════════════════════════
+def registrar_backup(licenca_id: int, cnpj: str, cliente_nome: str,
+                     arquivo_b2: str, tamanho_kb: int) -> int:
+    p = _ph()
+    conn = _conn()
+    try:
+        with _cur(conn) as cur:
+            if USE_POSTGRES:
+                cur.execute(
+                    f"INSERT INTO backups (licenca_id,cnpj,cliente_nome,arquivo_b2,tamanho_kb) "
+                    f"VALUES ({p},{p},{p},{p},{p}) RETURNING id",
+                    (licenca_id, cnpj, cliente_nome, arquivo_b2, tamanho_kb)
+                )
+                bid = cur.fetchone()[0]
+            else:
+                cur.execute(
+                    "INSERT INTO backups (licenca_id,cnpj,cliente_nome,arquivo_b2,tamanho_kb) "
+                    "VALUES (?,?,?,?,?)",
+                    (licenca_id, cnpj, cliente_nome, arquivo_b2, tamanho_kb)
+                )
+                bid = cur.lastrowid
+            conn.commit()
+            return bid
+    finally:
+        conn.close()
+
+
+def backups_por_cnpj(cnpj: str) -> list:
+    """Lista todos os backups de um CNPJ, do mais recente ao mais antigo."""
+    p = _ph()
+    conn = _conn()
+    try:
+        with _cur(conn) as cur:
+            cur.execute(
+                f"SELECT * FROM backups WHERE cnpj={p} ORDER BY criado_em DESC",
+                (cnpj,)
+            )
+            return _fetchall(cur)
+    finally:
+        conn.close()
+
+
+def buscar_backup(backup_id: int) -> dict | None:
+    p = _ph()
+    conn = _conn()
+    try:
+        with _cur(conn) as cur:
+            cur.execute(f"SELECT * FROM backups WHERE id={p}", (backup_id,))
+            return _fetchone(cur)
+    finally:
+        conn.close()
+
+
+def deletar_backup(backup_id: int):
+    p = _ph()
+    conn = _conn()
+    try:
+        with _cur(conn) as cur:
+            cur.execute(f"DELETE FROM backups WHERE id={p}", (backup_id,))
+            conn.commit()
+    finally:
+        conn.close()
+
+
+def listar_backups_admin() -> list:
+    """Retorna o último backup de cada CNPJ com total de registros guardados."""
+    conn = _conn()
+    try:
+        with _cur(conn) as cur:
+            cur.execute("""
+                SELECT b.cnpj, b.cliente_nome,
+                       b.criado_em   AS ultimo_backup,
+                       b.tamanho_kb,
+                       (SELECT COUNT(*) FROM backups b2 WHERE b2.cnpj = b.cnpj) AS total_backups
+                FROM backups b
+                WHERE b.criado_em = (
+                    SELECT MAX(b3.criado_em) FROM backups b3 WHERE b3.cnpj = b.cnpj
+                )
+                ORDER BY b.criado_em DESC
+            """)
+            rows = _fetchall(cur)
+    finally:
+        conn.close()
+
+    limite = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=48)
+    for r in rows:
+        ub = r.get("ultimo_backup")
+        if isinstance(ub, str):
+            try:
+                ub = datetime.datetime.fromisoformat(ub.replace(" ", "T"))
+            except Exception:
+                ub = None
+        r["atrasado"] = ub is None or (ub < limite)
+    return rows
 
 
 # ═══════════════════════════════════════════════════════════════
