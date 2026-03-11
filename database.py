@@ -521,3 +521,196 @@ def estatisticas() -> dict:
         "eventos_30d":   q(f"SELECT tipo, COUNT(*) as n FROM eventos WHERE criado_em >= {ago30} GROUP BY tipo ORDER BY n DESC LIMIT 10"),
         "ultimas_licencas": q("SELECT cliente_nome, chave, plano, status, versao_app, criado_em FROM licencas ORDER BY criado_em DESC LIMIT 10"),
     }
+
+
+# ═══════════════════════════════════════════════════════════════
+# Explorador de banco de dados (admin)
+# ═══════════════════════════════════════════════════════════════
+
+def _safe(val):
+    """Converte tipos Python não suportados pelo JSON (datetime, date) para string."""
+    if isinstance(val, (datetime.datetime, datetime.date)):
+        return val.isoformat()
+    return val
+
+
+def _safe_rows(rows: list) -> list:
+    return [{k: _safe(v) for k, v in r.items()} for r in rows]
+
+
+def db_listar_tabelas() -> list:
+    conn = _conn()
+    try:
+        with _cur(conn) as cur:
+            if USE_POSTGRES:
+                cur.execute("""
+                    SELECT table_name
+                    FROM information_schema.tables
+                    WHERE table_schema = 'public'
+                    ORDER BY table_name
+                """)
+            else:
+                cur.execute(
+                    "SELECT name AS table_name FROM sqlite_master "
+                    "WHERE type='table' ORDER BY name"
+                )
+            tabelas = [r["table_name"] for r in _fetchall(cur)]
+
+        resultado = []
+        for t in tabelas:
+            with _cur(conn) as cur:
+                cur.execute(f'SELECT COUNT(*) FROM "{t}"')
+                row = cur.fetchone()
+                resultado.append({"tabela": t, "total": row[0] if row else 0})
+        return resultado
+    finally:
+        conn.close()
+
+
+def db_dados_tabela(nome: str, pagina: int = 1, limite: int = 50,
+                    busca: str = "", ordem: str = "", direcao: str = "desc") -> dict:
+    p = _ph()
+    conn = _conn()
+    try:
+        # 1. Descobre colunas
+        with _cur(conn) as cur:
+            if USE_POSTGRES:
+                cur.execute("""
+                    SELECT column_name AS name, data_type
+                    FROM information_schema.columns
+                    WHERE table_name = %s AND table_schema = 'public'
+                    ORDER BY ordinal_position
+                """, (nome,))
+                colunas = _fetchall(cur)
+            else:
+                cur.execute(f"PRAGMA table_info({nome})")
+                colunas = [{"name": r["name"], "data_type": (r["type"] or "").upper()}
+                           for r in _fetchall(cur)]
+
+        col_names = [c["name"] for c in colunas]
+
+        # 2. Valida e normaliza parâmetros
+        if not ordem or ordem not in col_names:
+            ordem = "id" if "id" in col_names else (col_names[0] if col_names else "id")
+        direcao_sql = "ASC" if direcao.upper() == "ASC" else "DESC"
+        offset = (pagina - 1) * limite
+
+        # 3. Monta filtro de busca nas colunas texto
+        where_clause = ""
+        params_where: list = []
+        if busca:
+            op = "ILIKE" if USE_POSTGRES else "LIKE"
+            text_cols = [
+                c["name"] for c in colunas
+                if any(t in c.get("data_type", "").upper()
+                       for t in ("TEXT", "CHAR", "VARCHAR", "NAME"))
+            ]
+            if text_cols:
+                conds = " OR ".join(f'"{c}" {op} {p}' for c in text_cols)
+                where_clause = f"WHERE {conds}"
+                params_where = [f"%{busca}%"] * len(text_cols)
+
+        # 4. Executa COUNT e SELECT
+        with _cur(conn) as cur:
+            cur.execute(f'SELECT COUNT(*) FROM "{nome}" {where_clause}', params_where)
+            row = cur.fetchone()
+            total = row[0] if row else 0
+
+            cur.execute(
+                f'SELECT * FROM "{nome}" {where_clause} '
+                f'ORDER BY "{ordem}" {direcao_sql} '
+                f'LIMIT {limite} OFFSET {offset}',
+                params_where,
+            )
+            registros = _safe_rows(_fetchall(cur))
+
+        return {
+            "colunas":   col_names,
+            "registros": registros,
+            "total":     total,
+            "paginas":   max(1, (total + limite - 1) // limite),
+        }
+    finally:
+        conn.close()
+
+
+def db_editar_celula(tabela: str, row_id: int, campo: str, valor) -> None:
+    p = _ph()
+    conn = _conn()
+    try:
+        with _cur(conn) as cur:
+            cur.execute(
+                f'UPDATE "{tabela}" SET "{campo}" = {p} WHERE id = {p}',
+                (valor, row_id)
+            )
+            conn.commit()
+    finally:
+        conn.close()
+
+
+def db_executar_query(sql: str) -> dict:
+    conn = _conn()
+    try:
+        with _cur(conn) as cur:
+            cur.execute(sql)
+            rows_raw = cur.fetchmany(500)
+            cols = [d[0] for d in cur.description] if cur.description else []
+            if USE_POSTGRES:
+                registros = [{cols[i]: _safe(v) for i, v in enumerate(r)} for r in rows_raw]
+            else:
+                registros = _safe_rows([dict(r) for r in rows_raw])
+        return {"colunas": cols, "registros": registros, "total": len(registros)}
+    finally:
+        conn.close()
+
+
+def db_exportar_tabela(nome: str) -> tuple[list, list]:
+    conn = _conn()
+    try:
+        with _cur(conn) as cur:
+            cur.execute(f'SELECT * FROM "{nome}"')
+            cols = [d[0] for d in cur.description] if cur.description else []
+            if USE_POSTGRES:
+                rows = [[_safe(v) for v in r] for r in cur.fetchall()]
+            else:
+                rows = [[_safe(v) for v in dict(r).values()] for r in cur.fetchall()]
+        return cols, rows
+    finally:
+        conn.close()
+
+
+def db_estatisticas_grafico() -> dict:
+    ago30  = "NOW() - INTERVAL '30 days'"  if USE_POSTGRES else "datetime('now','-30 days')"
+    lim48h = "NOW() - INTERVAL '48 hours'" if USE_POSTGRES else "datetime('now','-48 hours')"
+    conn = _conn()
+    try:
+        def q(sql):
+            with _cur(conn) as cur:
+                cur.execute(sql)
+                return _safe_rows(_fetchall(cur))
+
+        def n(sql):
+            with _cur(conn) as cur:
+                cur.execute(sql)
+                row = cur.fetchone()
+                return row[0] if row else 0
+
+        return {
+            "por_status":     q("SELECT status, COUNT(*) AS n FROM licencas GROUP BY status"),
+            "por_plano":      q("SELECT plano, COUNT(*) AS n FROM licencas GROUP BY plano"),
+            "backups_7d":     q("SELECT DATE(criado_em) AS dia, COUNT(*) AS n "
+                                "FROM backups GROUP BY DATE(criado_em) "
+                                "ORDER BY dia DESC LIMIT 7"),
+            "eventos_30d":    q(f"SELECT tipo, COUNT(*) AS n FROM eventos "
+                                f"WHERE criado_em >= {ago30} "
+                                f"GROUP BY tipo ORDER BY n DESC LIMIT 8"),
+            "sem_backup_48h": n(f"""
+                SELECT COUNT(DISTINCT l.id) FROM licencas l
+                WHERE l.status = 'ATIVA'
+                AND NOT EXISTS (
+                    SELECT 1 FROM backups b
+                    WHERE b.licenca_id = l.id AND b.criado_em >= {lim48h}
+                )"""),
+        }
+    finally:
+        conn.close()

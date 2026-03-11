@@ -14,24 +14,37 @@ Endpoints admin (protegidos por API_KEY no header):
   POST /api/admin/licencas/<id>/revogar   — bloquear
   POST /api/admin/licencas/<id>/reativar  — desbloquear
   GET  /api/admin/dashboard         — estatísticas
-  GET  /api/admin/backups           — lista clientes com status de backup
-  GET  /api/admin/backup/download/<id>    — URL pré-assinada (1h) para download
+  GET  /api/admin/backups                    — lista clientes com status de backup
+  GET  /api/admin/backup/download/<id>       — URL pré-assinada (1h) para download
+  GET  /api/admin/db/tabelas                 — lista tabelas com total de registros
+  GET  /api/admin/db/tabela/<nome>           — dados paginados com busca e ordenação
+  POST /api/admin/db/tabela/<nome>/editar    — edita célula por id
+  POST /api/admin/db/query                   — executa SELECT livre (bloqueio de DML)
+  GET  /api/admin/db/exportar/<nome>         — download CSV da tabela
+  GET  /api/admin/db/estatisticas            — dados para gráficos do painel
 
 Backup (chamado pelo PDV do cliente):
   POST /api/backup/upload           — envia ZIP ao Backblaze B2
 """
 import os
+import re
+import io
+import csv
 import hmac
 import hashlib
 import secrets
 import datetime
 import json
 from functools import wraps
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 import boto3
 from botocore.config import Config
 import database as db
+
+_VALID_IDENT   = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
+_CAMPOS_IMUT   = {"id", "criado_em", "chave_hash"}
+_PALAVRAS_PERI = {"DROP", "DELETE", "UPDATE", "INSERT", "TRUNCATE", "ALTER"}
 
 app = Flask(__name__)
 CORS(app)  # permite requisições do painel Netlify
@@ -458,6 +471,116 @@ def admin_backup_download(backup_id):
         ExpiresIn=3600,
     )
     return jsonify({"url": url})
+
+
+# ═══════════════════════════════════════════════════════════════
+# EXPLORADOR DE BANCO (admin)
+# ═══════════════════════════════════════════════════════════════
+
+@app.get("/api/admin/db/tabelas")
+@requer_admin
+def db_tabelas():
+    return jsonify(db.db_listar_tabelas())
+
+
+@app.get("/api/admin/db/tabela/<nome>")
+@requer_admin
+def db_tabela(nome):
+    if not _VALID_IDENT.match(nome):
+        return jsonify({"erro": "Nome de tabela inválido"}), 400
+
+    try:
+        pagina  = max(1, int(request.args.get("pagina", 1)))
+        limite  = min(200, max(1, int(request.args.get("limite", 50))))
+    except ValueError:
+        return jsonify({"erro": "pagina e limite devem ser inteiros"}), 400
+
+    busca   = request.args.get("busca", "").strip()
+    ordem   = request.args.get("ordem", "").strip()
+    direcao = request.args.get("direcao", "desc").strip()
+
+    try:
+        resultado = db.db_dados_tabela(nome, pagina, limite, busca, ordem, direcao)
+    except Exception as e:
+        return jsonify({"erro": str(e)}), 400
+    return jsonify(resultado)
+
+
+@app.post("/api/admin/db/tabela/<nome>/editar")
+@requer_admin
+def db_editar(nome):
+    if not _VALID_IDENT.match(nome):
+        return jsonify({"erro": "Nome de tabela inválido"}), 400
+
+    body  = request.get_json(silent=True) or {}
+    rid   = body.get("id")
+    campo = str(body.get("campo") or "")
+    valor = body.get("valor")
+
+    if not _VALID_IDENT.match(campo):
+        return jsonify({"erro": "Nome de campo inválido"}), 400
+    if campo in _CAMPOS_IMUT:
+        return jsonify({"erro": f"Campo '{campo}' não pode ser editado"}), 400
+    if rid is None:
+        return jsonify({"erro": "id obrigatório"}), 400
+
+    try:
+        db.db_editar_celula(nome, int(rid), campo, valor)
+    except Exception as e:
+        return jsonify({"erro": str(e)}), 400
+    return jsonify({"ok": True})
+
+
+@app.post("/api/admin/db/query")
+@requer_admin
+def db_query():
+    sql = (request.get_json(silent=True) or {}).get("sql", "").strip()
+    if not sql:
+        return jsonify({"erro": "SQL não informado"}), 400
+
+    sql_upper = sql.upper()
+    if not sql_upper.lstrip().startswith("SELECT"):
+        return jsonify({"erro": "Apenas consultas SELECT são permitidas"}), 400
+    for palavra in _PALAVRAS_PERI:
+        if palavra in sql_upper:
+            return jsonify({"erro": f"Palavra-chave proibida: {palavra}"}), 400
+
+    try:
+        resultado = db.db_executar_query(sql)
+    except Exception as e:
+        return jsonify({"erro": str(e)}), 400
+    return jsonify(resultado)
+
+
+@app.get("/api/admin/db/exportar/<nome>")
+@requer_admin
+def db_exportar(nome):
+    if not _VALID_IDENT.match(nome):
+        return jsonify({"erro": "Nome de tabela inválido"}), 400
+
+    try:
+        colunas, rows = db.db_exportar_tabela(nome)
+    except Exception as e:
+        return jsonify({"erro": str(e)}), 400
+
+    saida = io.StringIO()
+    writer = csv.writer(saida)
+    writer.writerow(colunas)
+    writer.writerows(rows)
+
+    hoje     = datetime.date.today().isoformat()
+    filename = f"{nome}_{hoje}.csv"
+    return Response(
+        saida.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+@app.get("/api/admin/db/estatisticas")
+@requer_admin
+def db_estatisticas():
+    return jsonify(db.db_estatisticas_grafico())
 
 
 # ── Health check (Render usa para saber se está vivo) ─────────
