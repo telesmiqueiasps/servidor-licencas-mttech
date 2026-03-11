@@ -431,7 +431,8 @@ def listar_backups_admin() -> list:
     finally:
         conn.close()
 
-    limite = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=48)
+    # limite naive (sem tzinfo) — psycopg2 retorna TIMESTAMP como datetime naive
+    limite = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) - datetime.timedelta(hours=48)
     for r in rows:
         ub = r.get("ultimo_backup")
         if isinstance(ub, str):
@@ -439,6 +440,9 @@ def listar_backups_admin() -> list:
                 ub = datetime.datetime.fromisoformat(ub.replace(" ", "T"))
             except Exception:
                 ub = None
+        # normaliza para naive caso venha com tzinfo (ex: TIMESTAMPTZ)
+        if isinstance(ub, datetime.datetime) and ub.tzinfo is not None:
+            ub = ub.replace(tzinfo=None)
         r["atrasado"] = ub is None or (ub < limite)
     return rows
 
